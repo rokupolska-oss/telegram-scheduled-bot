@@ -1,3 +1,4 @@
+
 name: Telegram Scheduled Bots
 
 on:
@@ -15,6 +16,7 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 4
 
     steps:
       - name: Get repository files
@@ -38,6 +40,7 @@ jobs:
         run: python bot.py
 
       - name: Save subscriber data
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
