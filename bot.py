@@ -54,19 +54,23 @@ def telegram_api(token, method, payload=None):
 
 def process_updates(bot_id, token, subscribers, state):
     offset = state.get(bot_id, 0)
+
     updates = telegram_api(
-        token, "getUpdates", {"offset": offset, "timeout": 0}
+        token,
+        "getUpdates",
+        {"offset": offset, "timeout": 0},
     )
 
     subscribers.setdefault(bot_id, [])
 
     for update in updates:
         state[bot_id] = update["update_id"] + 1
+
         message = update.get("message", {})
         text = message.get("text", "").strip()
         chat_id = message.get("chat", {}).get("id")
 
-        # Rejestrujemy /start bez wysyłania powitania.
+        # Rejestrujemy /start, ale nie wysyłamy powitania.
         if text == "/start" and chat_id is not None:
             if chat_id not in subscribers[bot_id]:
                 subscribers[bot_id].append(chat_id)
@@ -79,6 +83,7 @@ def personalize_text(token, chat_id, text):
         return text
 
     chat = telegram_api(token, "getChat", {"chat_id": chat_id})
+
     username = chat.get("username")
 
     if username:
@@ -86,7 +91,10 @@ def personalize_text(token, chat_id, text):
     else:
         display_name = chat.get("first_name") or "Cześć"
 
-    return text.replace("{username}", html.escape(display_name))
+    return text.replace(
+        "{username}",
+        html.escape(display_name),
+    )
 
 
 def send_due_posts(subscribers, sent):
@@ -94,22 +102,30 @@ def send_due_posts(subscribers, sent):
     today = now.strftime("%Y-%m-%d")
 
     with CALENDAR_FILE.open(
-        "r", encoding="utf-8-sig", newline=""
+        "r",
+        encoding="utf-8-sig",
+        newline="",
     ) as f:
         posts = list(csv.DictReader(f))
 
     for post in posts:
-        bot_id = post["bot"].strip().lower()
-        post_id = post["id"].strip()
+        bot_id = post.get("bot", "").strip().lower()
+        post_id = post.get("id", "").strip()
+        post_date = post.get("date", "").strip()
         token = BOTS.get(bot_id)
 
         if not token:
             print(f"Missing token for {bot_id}")
             continue
 
+        # Важно: отправляем только публикации на сегодняшнюю дату.
+        if post_date != today:
+            continue
+
         try:
             post_time = datetime.strptime(
-                post["time"].strip(), "%H:%M"
+                post.get("time", "").strip(),
+                "%H:%M",
             ).time()
         except ValueError:
             print(f"Invalid time for post {post_id}")
@@ -119,6 +135,8 @@ def send_due_posts(subscribers, sent):
             continue
 
         sent_key = f"{today}:{bot_id}:{post_id}"
+
+        # Не отправляем пост, если он уже отмечен как отправленный.
         if sent_key in sent:
             continue
 
@@ -127,11 +145,14 @@ def send_due_posts(subscribers, sent):
         post_type = (post.get("type") or "text").strip().lower()
 
         all_sent = True
+        chat_ids = list(subscribers.get(bot_id, []))
 
-        for chat_id in subscribers.get(bot_id, []):
+        for chat_id in chat_ids:
             try:
                 message_text = personalize_text(
-                    token, chat_id, text
+                    token,
+                    chat_id,
+                    text,
                 )
 
                 if post_type == "image":
@@ -139,6 +160,7 @@ def send_due_posts(subscribers, sent):
                         "chat_id": chat_id,
                         "photo": url,
                     }
+
                     if message_text:
                         payload["caption"] = message_text
                         payload["parse_mode"] = "HTML"
@@ -146,11 +168,15 @@ def send_due_posts(subscribers, sent):
                     telegram_api(token, "sendPhoto", payload)
 
                 elif post_type == "text":
-                    telegram_api(token, "sendMessage", {
-                        "chat_id": chat_id,
-                        "text": message_text,
-                        "parse_mode": "HTML",
-                    })
+                    telegram_api(
+                        token,
+                        "sendMessage",
+                        {
+                            "chat_id": chat_id,
+                            "text": message_text,
+                            "parse_mode": "HTML",
+                        },
+                    )
 
                 else:
                     print(f"Unknown post type: {post_type}")
@@ -163,6 +189,8 @@ def send_due_posts(subscribers, sent):
                     f"post {post_id}: {error}"
                 )
 
+        # Считаем публикацию отправленной только при успехе
+        # для всех подписчиков этого бота.
         if all_sent:
             sent.add(sent_key)
 
@@ -181,7 +209,10 @@ def main():
 
         try:
             subscribers, state = process_updates(
-                bot_id, token, subscribers, state
+                bot_id,
+                token,
+                subscribers,
+                state,
             )
         except Exception as error:
             print(f"Update error for {bot_id}: {error}")
