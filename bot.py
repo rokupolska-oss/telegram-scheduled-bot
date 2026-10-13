@@ -1,5 +1,6 @@
 
 import csv
+import html
 import json
 import os
 from datetime import datetime
@@ -27,15 +28,15 @@ BOTS = {
 
 def load_json(path, default):
     if path.exists():
-        with path.open("r", encoding="utf-8") as file:
-            return json.load(file)
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
     return default
 
 
 def save_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as file:
-        json.dump(data, file, ensure_ascii=False, indent=2)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def telegram_api(token, method, payload=None):
@@ -46,57 +47,56 @@ def telegram_api(token, method, payload=None):
     )
     response.raise_for_status()
     result = response.json()
-
     if not result.get("ok"):
         raise RuntimeError(f"Telegram API error: {result}")
-
     return result["result"]
 
 
 def process_updates(bot_id, token, subscribers, state):
     offset = state.get(bot_id, 0)
-
     updates = telegram_api(
-        token,
-        "getUpdates",
-        {"offset": offset, "timeout": 0},
+        token, "getUpdates", {"offset": offset, "timeout": 0}
     )
+
+    subscribers.setdefault(bot_id, [])
 
     for update in updates:
         state[bot_id] = update["update_id"] + 1
-
         message = update.get("message", {})
-        text = message.get("text", "")
-        chat = message.get("chat", {})
+        text = message.get("text", "").strip()
+        chat_id = message.get("chat", {}).get("id")
 
-        if text.strip() == "/start" and chat.get("id") is not None:
-            chat_id = chat["id"]
-            subscribers.setdefault(bot_id, [])
-
+        # Rejestrujemy /start bez wysyłania powitania.
+        if text == "/start" and chat_id is not None:
             if chat_id not in subscribers[bot_id]:
                 subscribers[bot_id].append(chat_id)
-
-            telegram_api(
-                token,
-                "sendMessage",
-                {
-                    "chat_id": chat_id,
-                    "text": (
-                        "Cześć! 👋\n\n"
-                        "Dziękujemy za dołączenie!\n"
-                        "Będziesz otrzymywać zaplanowane publikacje. 📅"
-                    ),
-                },
-            )
 
     return subscribers, state
 
 
+def personalize_text(token, chat_id, text):
+    if "{username}" not in text:
+        return text
+
+    chat = telegram_api(token, "getChat", {"chat_id": chat_id})
+    username = chat.get("username")
+
+    if username:
+        display_name = "@" + username
+    else:
+        display_name = chat.get("first_name") or "Cześć"
+
+    return text.replace("{username}", html.escape(display_name))
+
+
 def send_due_posts(subscribers, sent):
     now = datetime.now(TIMEZONE)
+    today = now.strftime("%Y-%m-%d")
 
-    with CALENDAR_FILE.open("r", encoding="utf-8-sig", newline="") as file:
-        posts = list(csv.DictReader(file))
+    with CALENDAR_FILE.open(
+        "r", encoding="utf-8-sig", newline=""
+    ) as f:
+        posts = list(csv.DictReader(f))
 
     for post in posts:
         bot_id = post["bot"].strip().lower()
@@ -104,63 +104,67 @@ def send_due_posts(subscribers, sent):
         token = BOTS.get(bot_id)
 
         if not token:
+            print(f"Missing token for {bot_id}")
             continue
 
         try:
-            scheduled = datetime.strptime(
-                f'{post["date"]} {post["time"]}',
-                "%Y-%m-%d %H:%M",
-            ).replace(tzinfo=TIMEZONE)
+            post_time = datetime.strptime(
+                post["time"].strip(), "%H:%M"
+            ).time()
         except ValueError:
-            print(f"Invalid date/time for post {post_id}")
+            print(f"Invalid time for post {post_id}")
             continue
 
-        # Send only today's scheduled posts, including posts
-        # delayed by a few minutes.
-        if scheduled.date() != now.date() or scheduled > now:
+        if post_time > now.time():
             continue
 
-        sent_key = f"{bot_id}:{post_id}"
-
+        sent_key = f"{today}:{bot_id}:{post_id}"
         if sent_key in sent:
             continue
 
         text = (post.get("text") or "").replace("\\n", "\n")
         url = (post.get("url") or "").strip()
-        post_type = post["type"].strip().lower()
+        post_type = (post.get("type") or "text").strip().lower()
+
+        all_sent = True
 
         for chat_id in subscribers.get(bot_id, []):
             try:
-                if post_type == "image":
-                    payload = {"chat_id": chat_id, "photo": url}
+                message_text = personalize_text(
+                    token, chat_id, text
+                )
 
-                    if text:
-                        payload["caption"] = text
+                if post_type == "image":
+                    payload = {
+                        "chat_id": chat_id,
+                        "photo": url,
+                    }
+                    if message_text:
+                        payload["caption"] = message_text
                         payload["parse_mode"] = "HTML"
 
                     telegram_api(token, "sendPhoto", payload)
 
                 elif post_type == "text":
-                    telegram_api(
-                        token,
-                        "sendMessage",
-                        {
-                            "chat_id": chat_id,
-                            "text": text,
-                            "parse_mode": "HTML",
-                        },
-                    )
+                    telegram_api(token, "sendMessage", {
+                        "chat_id": chat_id,
+                        "text": message_text,
+                        "parse_mode": "HTML",
+                    })
 
                 else:
                     print(f"Unknown post type: {post_type}")
+                    all_sent = False
 
             except Exception as error:
+                all_sent = False
                 print(
                     f"Failed: {bot_id}, chat {chat_id}, "
                     f"post {post_id}: {error}"
                 )
 
-        sent.add(sent_key)
+        if all_sent:
+            sent.add(sent_key)
 
     return sent
 
