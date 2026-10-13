@@ -3,7 +3,7 @@ import csv
 import html
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -16,6 +16,10 @@ STATE_FILE = BASE_DIR / "subscribers" / "state.json"
 SENT_FILE = BASE_DIR / "subscribers" / "sent.json"
 
 TIMEZONE = ZoneInfo("Europe/Warsaw")
+
+# Разрешаем отправку в течение 20 минут после планового времени.
+# Пропущенные публикации не будут отправляться все сразу.
+GRACE_MINUTES = 20
 
 BOTS = {
     "bot01": os.getenv("BOT_01_TOKEN"),
@@ -35,8 +39,12 @@ def load_json(path, default):
 
 def save_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+
+    with temp_path.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+    os.replace(temp_path, path)
 
 
 def telegram_api(token, method, payload=None):
@@ -46,36 +54,12 @@ def telegram_api(token, method, payload=None):
         timeout=30,
     )
     response.raise_for_status()
+
     result = response.json()
     if not result.get("ok"):
         raise RuntimeError(f"Telegram API error: {result}")
+
     return result["result"]
-
-
-def process_updates(bot_id, token, subscribers, state):
-    offset = state.get(bot_id, 0)
-
-    updates = telegram_api(
-        token,
-        "getUpdates",
-        {"offset": offset, "timeout": 0},
-    )
-
-    subscribers.setdefault(bot_id, [])
-
-    for update in updates:
-        state[bot_id] = update["update_id"] + 1
-
-        message = update.get("message", {})
-        text = message.get("text", "").strip()
-        chat_id = message.get("chat", {}).get("id")
-
-        # Rejestrujemy /start, ale nie wysyłamy powitania.
-        if text == "/start" and chat_id is not None:
-            if chat_id not in subscribers[bot_id]:
-                subscribers[bot_id].append(chat_id)
-
-    return subscribers, state
 
 
 def personalize_text(token, chat_id, text):
@@ -83,7 +67,6 @@ def personalize_text(token, chat_id, text):
         return text
 
     chat = telegram_api(token, "getChat", {"chat_id": chat_id})
-
     username = chat.get("username")
 
     if username:
@@ -102,9 +85,7 @@ def send_due_posts(subscribers, sent):
     today = now.strftime("%Y-%m-%d")
 
     with CALENDAR_FILE.open(
-        "r",
-        encoding="utf-8-sig",
-        newline="",
+        "r", encoding="utf-8-sig", newline=""
     ) as f:
         posts = list(csv.DictReader(f))
 
@@ -114,12 +95,12 @@ def send_due_posts(subscribers, sent):
         post_date = post.get("date", "").strip()
         token = BOTS.get(bot_id)
 
-        if not token:
-            print(f"Missing token for {bot_id}")
+        # Tylko dzisiejsze publikacje.
+        if post_date != today:
             continue
 
-        # Важно: отправляем только публикации на сегодняшнюю дату.
-        if post_date != today:
+        if not token:
+            print(f"Missing token for {bot_id}")
             continue
 
         try:
@@ -131,28 +112,50 @@ def send_due_posts(subscribers, sent):
             print(f"Invalid time for post {post_id}")
             continue
 
-        if post_time > now.time():
+        scheduled = datetime.combine(
+            now.date(),
+            post_time,
+            tzinfo=TIMEZONE,
+        )
+
+        # Nie wysyляем заранее или слишком поздно.
+        if now < scheduled:
             continue
 
-        sent_key = f"{today}:{bot_id}:{post_id}"
+        if now >= scheduled + timedelta(minutes=GRACE_MINUTES):
+            print(f"Skipping expired post: {bot_id}, {post_id}")
+            continue
 
-        # Не отправляем пост, если он уже отмечен как отправленный.
-        if sent_key in sent:
+        # Старый ключ нужен для совместимости с sent.json.
+        legacy_key = f"{today}:{bot_id}:{post_id}"
+
+        # Если старый код уже отметил пост отправленным,
+        # не отправляем его повторно.
+        if legacy_key in sent:
+            print(f"Already sent (legacy): {bot_id}, {post_id}")
             continue
 
         text = (post.get("text") or "").replace("\\n", "\n")
         url = (post.get("url") or "").strip()
         post_type = (post.get("type") or "text").strip().lower()
 
-        all_sent = True
-        chat_ids = list(subscribers.get(bot_id, []))
+        chat_ids = set(subscribers.get(bot_id, []))
 
-        for chat_id in chat_ids:
+        if not chat_ids:
+            print(f"No subscribers for {bot_id}")
+            continue
+
+        for chat_id in sorted(chat_ids):
+            # Учитываем отправку отдельно для каждого чата.
+            chat_key = f"{today}:{bot_id}:{post_id}:{chat_id}"
+
+            if chat_key in sent:
+                print(f"Already sent: {bot_id}, {post_id}, chat {chat_id}")
+                continue
+
             try:
                 message_text = personalize_text(
-                    token,
-                    chat_id,
-                    text,
+                    token, chat_id, text
                 )
 
                 if post_type == "image":
@@ -180,51 +183,33 @@ def send_due_posts(subscribers, sent):
 
                 else:
                     print(f"Unknown post type: {post_type}")
-                    all_sent = False
+                    continue
+
+                # Сохраняем отметку сразу после успешного ответа Telegram.
+                sent.add(chat_key)
+                save_json(SENT_FILE, sorted(sent))
+
+                print(f"Sent: {bot_id}, {post_id}, chat {chat_id}")
 
             except Exception as error:
-                all_sent = False
                 print(
                     f"Failed: {bot_id}, chat {chat_id}, "
                     f"post {post_id}: {error}"
                 )
 
-        # Считаем публикацию отправленной только при успехе
-        # для всех подписчиков этого бота.
-        if all_sent:
-            sent.add(sent_key)
-
-    return sent
-
 
 def main():
     subscribers = load_json(SUBSCRIBERS_FILE, {})
-    state = load_json(STATE_FILE, {})
     sent = set(load_json(SENT_FILE, []))
 
-    for bot_id, token in BOTS.items():
-        if not token:
-            print(f"Missing token for {bot_id}")
-            continue
+    # Этот процесс не опрашивает getUpdates и не отправляет /start.
+    # Список подписчиков берётся из subscribers.json.
+    send_due_posts(subscribers, sent)
 
-        try:
-            subscribers, state = process_updates(
-                bot_id,
-                token,
-                subscribers,
-                state,
-            )
-        except Exception as error:
-            print(f"Update error for {bot_id}: {error}")
-
-    try:
-        sent = send_due_posts(subscribers, sent)
-    except Exception as error:
-        print(f"Scheduler error: {error}")
-
+    # Сохраняем файлы, не связанные с отправкой, без изменения структуры.
+    state = load_json(STATE_FILE, {})
     save_json(SUBSCRIBERS_FILE, subscribers)
     save_json(STATE_FILE, state)
-    save_json(SENT_FILE, sorted(sent))
 
 
 if __name__ == "__main__":
